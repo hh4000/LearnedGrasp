@@ -1,5 +1,6 @@
 # Deep learning for grasp inference of the HOT3D dataset
  <img src="img.png">
+
 In the present repository, I have attempted to learn the grasp from just visual and gaze data. 
 All attempted models can be found in [`src/graspcnn/models.py`](src/graspcnn/models.py).
 You will be able to see that I eventually strayed away from CNN models in favor of GNN models. 
