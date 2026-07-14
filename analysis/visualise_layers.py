@@ -14,13 +14,22 @@ import numpy as np
 import torch
 from nicegui import ui
 
-from MODELS import *
-from grasp_image_set import GraspImageDataset
+from graspcnn.models import (
+    GraspCNNv1,
+    GraspCNNv2,
+    GraspCNNv3,
+    MANOGraspCNNv1,
+    MANOGraspCNNv2,
+    MANOGraspCNNv3,
+)
+from graspcnn.data import GraspImageDataset
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
-MODELS_DIR = os.path.join(os.path.dirname(__file__), 'models')
-PARAMS_DIR = os.path.join(os.path.dirname(__file__), 'params')
+# models/ and params/ live at the repo root (one level above analysis/).
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+MODELS_DIR = os.path.join(_REPO_ROOT, 'models')
+PARAMS_DIR = os.path.join(_REPO_ROOT, 'params')
 DATA_DIR   = os.path.expanduser('~/Documents/P10/hot3d/data')
 
 MODELS = {

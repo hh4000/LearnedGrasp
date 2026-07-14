@@ -1,14 +1,48 @@
 # Deep learning for grasp inference of the HOT3D dataset
  <img src="img.png">
 In the present repository, I have attempted to learn the grasp from just visual and gaze data. 
-All attempted models can be found in [<b>./MODELS.py</b>].
+All attempted models can be found in [<b>src/graspcnn/models.py</b>].
 You will be able to see that I eventually strayed away from CNN models in favor of GNN models. 
 This is rather a change in object representation from RGB image to 3D mesh.
 Ultimately the models I made were dubious, with lackluster (but statistically significant) performance.
 I want to note that the models here are made to regress the MANO pose (PCA-decomposed joint angles), which substantially raised the difficulty; this was to avoid the unclear classification boundaries that are natural with discrete grasp classification.
 
+## Repository layout
+```
+src/graspcnn/          Installable library package
+  models.py            CNN / GNN model definitions (MANO-pose regression)
+  losses.py            Custom loss functions (FocalLoss, GaussianNLLLoss)
+  features.py          Engineered geometric feature extraction
+  data/                Datasets: image_set.py, mesh_set.py
+  training/            Shared training infrastructure
+                         base.py — Trainer, DataLoaderGetter, R2Accumulator
+                         ui.py   — NiceGUI chart/config helpers
+scripts/               Runnable entrypoints
+  train_ui.py            NiceGUI: image classification
+  train_regression_ui.py NiceGUI: image → MANO-pose regression
+  train_gnn_ui.py        NiceGUI: mesh (GNN) regression
+  train_gnn_batch.py     Headless batched GNN trial runner
+  encoding_test.py       Contrastive mesh-embedding experiment
+analysis/              Plotting, statistics, and visualisation scripts
+```
+
+## Setup & running
+Install the package (editable) into your environment, then run any entrypoint
+**from the repository root** (scripts resolve `models/`, `params/`, `results/`,
+`train_log/` and the config JSONs relative to the working directory):
+
+```bash
+uv pip install -e .          # or: pip install -e .   (alt: PYTHONPATH=src)
+python scripts/train_gnn_ui.py
+python scripts/train_gnn_batch.py
+```
+
+Datasets cached before this restructure still load: legacy pickle module paths
+(`grasp_mesh_set`, `MODELS`, …) are aliased to the new package modules in
+`graspcnn._compat`.
+
 ## Latest developments
-Before hand-in of my master thesis, I rushed out a script to attempt contrastive learning (<b>./encoding-test.py</b>), where I tried to see if the GNN could learn object affordance from object geometry alone.
+Before hand-in of my master thesis, I rushed out a script to attempt contrastive learning (<b>scripts/encoding_test.py</b>), where I tried to see if the GNN could learn object affordance from object geometry alone.
 This was achieved by simply picking an anchor, and giving 3 positive (similar) examples and 2 negative (dissimilar) examples.
 These are:
 - <b>anchor</b> (original point)
@@ -28,7 +62,10 @@ I believe pretraining an embedding network to understand object geometry is the 
 
 
 # Dev note
-I apologize here for the messy repo; frankly, I needed more time to make it, hence why it is not super well maintained. I intend to clean it up more, but I wanted it to be able to hand it over ASAP.
+The codebase was restructured into an installable `graspcnn` package with the
+runnable scripts split into `scripts/` (training) and `analysis/`. The training
+front-ends now share a common `Trainer` base and helpers under
+`graspcnn.training`.
 
 If you need any help feel free to contact me via: 
 - <b>WhatsApp</b>: +45 4250 6200

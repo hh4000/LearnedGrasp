@@ -1,7 +1,7 @@
-from grasp_mesh_set import PrecachedMANOGraspDataset
+from graspcnn.data import PrecachedMANOGraspDataset
 import torch
 from torch_geometric.data import Batch
-from engineered_features import FeatureCalculator
+from graspcnn.features import FeatureCalculator
 from tqdm import tqdm
 
 from sklearn.svm import SVR

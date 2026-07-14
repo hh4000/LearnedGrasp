@@ -35,7 +35,7 @@ import trimesh
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
-from grasp_mesh_set import PrecachedMANOGraspDataset  # noqa: F401  (needed for torch.load)
+from graspcnn.data import PrecachedMANOGraspDataset  # noqa: F401  (needed for torch.load)
 
 # Where the original .glb meshes live (the paths stored in the dataset are
 # relative and were created on another working dir).

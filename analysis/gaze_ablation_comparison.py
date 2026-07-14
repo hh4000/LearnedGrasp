@@ -47,7 +47,7 @@ try:
     import matplotlib.pyplot as plt
     _spec = importlib.util.spec_from_file_location(
         "configure_fig",
-        pathlib.Path(__file__).resolve().parent.parent / "PaperFormatting" / "configure-fig.py",
+        pathlib.Path(__file__).resolve().parent.parent.parent / "PaperFormatting" / "configure-fig.py",
     )
     _cfig = importlib.util.module_from_spec(_spec)
     _spec.loader.exec_module(_cfig)

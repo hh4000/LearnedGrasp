@@ -1,10 +1,7 @@
-import os
 from functools import cached_property
-import pandas as pd
 import torch
 from pathlib import Path
 from torch_geometric.data import Data, Dataset
-import torch_geometric as T
 import hashlib
 import trimesh
 from dataclasses import dataclass

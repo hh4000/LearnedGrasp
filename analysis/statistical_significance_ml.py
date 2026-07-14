@@ -18,7 +18,7 @@ from sklearn.linear_model import LinearRegression, Ridge
 from sklearn.metrics import r2_score
 from sklearn.model_selection import KFold
 
-from engineered_features import FeatureCalculator
+from graspcnn.features import FeatureCalculator
 
 # ── Config ────────────────────────────────────────────────────────────────────
 N_FOLDS   = 10

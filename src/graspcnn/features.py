@@ -97,7 +97,7 @@ class FeatureCalculator:
 
 
 if __name__ == "__main__":
-    from grasp_mesh_set import PrecachedMANOGraspDataset
+    from graspcnn.data.mesh_set import PrecachedMANOGraspDataset  # noqa: F401  (needed for torch.load)
 
     dataset = torch.load('.data_cache/data_src_test.pt', weights_only=False)
     sample = dataset[0]

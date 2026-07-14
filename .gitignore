@@ -5,3 +5,19 @@
 /results/
 /scrapped/
 /train_log/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+
+# IDE
+/.idea/
+
+# Trained weights / artifacts (kept on disk, not tracked)
+*.pth
+*.pt
+
+# Run outputs
+/Results_*.txt
+/ml_results.*

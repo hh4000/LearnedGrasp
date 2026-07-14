@@ -1,6 +1,6 @@
 import torch
 from torch import Tensor, nn, cat
-from torch_geometric.nn import GCNConv, EdgeConv, global_max_pool as graph_global_max_pool, global_mean_pool as graph_global_mean_pool, fps
+from torch_geometric.nn import GCNConv, EdgeConv, global_max_pool as graph_global_max_pool, global_mean_pool as graph_global_mean_pool
 
 from torch_geometric.data import Data as GeoData
 import torch.nn.functional as F

@@ -1,22 +1,26 @@
 """NiceGUI training interface for MANOGraspGNN models."""
 
-import datetime
-import json
 import os
 import queue
 import sys
 import threading
-import time
-from itertools import chain
 
-import pandas as pd
 import torch
 from torch import nn, optim
 from torch_geometric.loader import DataLoader as GeoDataLoader
 from nicegui import ui
 
-import grasp_mesh_set
-from MODELS import *
+import graspcnn.data.mesh_set as grasp_mesh_set
+from graspcnn.models import (
+    MANOGraspGNNv1,
+    MANOGraspGNNv2,
+    MANOGraspGNNv3,
+    MANOGraspGNNv4,
+    MANOGraspGNNv5,
+    MANOGraspGNNv6,
+    MANOGraspGNNv7,
+)
+from graspcnn.training import ConfigStore, Trainer, chart_options
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -34,7 +38,8 @@ LOSSES = {
     'HuberLoss': nn.HuberLoss,
 }
 
-CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'train_gnn_config.json')
+# Config lives at the repo root (one level above scripts/).
+CONFIG_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'train_gnn_config.json')
 _DATA_DIR   = os.path.expanduser('~/Documents/P10/hot3d/data')
 DEFAULT_PATHS = {
     'train_path': os.path.join(_DATA_DIR, 'train_gnn.pt'),
@@ -42,19 +47,19 @@ DEFAULT_PATHS = {
     'test_path':  os.path.join(_DATA_DIR, 'test_gnn.pt'),
 }
 
-def _load_config() -> dict:
-    if os.path.exists(CONFIG_FILE):
-        try:
-            return {**DEFAULT_PATHS, **json.load(open(CONFIG_FILE))}
-        except Exception:
-            pass
-    return DEFAULT_PATHS.copy()
-
-def _save_config(paths: dict):
-    json.dump(paths, open(CONFIG_FILE, 'w'), indent=2)
+_config = ConfigStore(CONFIG_FILE, DEFAULT_PATHS)
 
 
 # ── Training thread ───────────────────────────────────────────────────────────
+
+class _GNNTrainer(Trainer):
+    """Regression trainer for graph batches (torch_geometric ``Data``)."""
+
+    def forward_batch(self, batch):
+        batch = batch.to(self.device)
+        labels = batch.y[:, :self.n_outputs].float()
+        return self.model(batch).float(), labels
+
 
 def training_thread(cfg: dict, result_q: queue.Queue, stop_evt: threading.Event):
     try:
@@ -82,150 +87,25 @@ def training_thread(cfg: dict, result_q: queue.Queue, stop_evt: threading.Event)
             optimizer, mode='min', factor=0.5, patience=cfg['scheduler_patience']
         )
 
-        dt = datetime.datetime.now()
-        run_id = dt.strftime('%y%m%d_%H%M%S')
-        params = {
-            'date': {'year': dt.year, 'month': dt.month, 'day': dt.day,
-                     'hour': dt.hour, 'minute': dt.minute, 'second': dt.second},
+        trainer = _GNNTrainer(model, criterion, optimizer, scheduler,
+                              result_q=result_q, stop_evt=stop_evt,
+                              n_outputs=cfg['output_channels'], device='cuda')
+        trainer.dump_params(trainer.base_params(cfg, extra={
             'dropout_gnn': cfg['dropout_gnn'],
-            'dropout_fc':  cfg['dropout_fc'],
-            'max_epochs':  cfg['epochs'],
             'loss_function': {'name': cfg['loss']},
-            'optimizer': {'name': 'Adam', 'kwargs': {'lr': cfg['lr'], 'weight_decay': cfg['weight_decay']}},
-            'architecture': str(model),
-        }
-        json.dump(params, open(f'params/params_{run_id}.json', 'w'), indent=2)
-        result_q.put(('status', f'Run {run_id} — training started.'))
-
-        n_outputs = cfg['output_channels']
-        r2_header = '\t'.join(f'Val R2[{i}]' for i in range(n_outputs))
-        with open(f'train_log/train_log_{run_id}.txt', 'w') as log:
-            log.write(f'Epoch\tTrain Loss\tVal Loss\tVal R2 Mean\t{r2_header}\tLR\n')
-
-            for epoch in range(cfg['epochs']):
-                if stop_evt.is_set():
-                    result_q.put(('status', f'Stopped by user at epoch {epoch + 1}.'))
-                    break
-
-                t0 = time.time()
-                model.train()
-                train_loss = torch.tensor(0.0, device='cuda')
-                print("Training epoch:", epoch + 1)
-
-                for batch in train_loader:
-                    batch  = batch.to('cuda')
-                    labels = batch.y[:, :n_outputs].float()
-                    optimizer.zero_grad()
-                    out  = model(batch).float()
-                    loss = criterion(out, labels)
-                    loss.backward()
-                    optimizer.step()
-                    train_loss += loss.detach()
-
-                epoch_train_loss = (train_loss / len(train_loader)).item()
-                t1 = time.time()
-
-                # validation loss + R² (computational formula, single pass)
-                model.eval()
-                val_loss_sum = 0.0
-                ss_res   = torch.zeros(n_outputs, device='cuda')
-                sum_t    = torch.zeros(n_outputs, device='cuda')
-                sum_sq_t = torch.zeros(n_outputs, device='cuda')
-                n_total  = 0
-                print("Validation epoch:", epoch + 1)
-                with torch.no_grad():
-                    for batch in val_loader:
-                        batch  = batch.to('cuda')
-                        labels = batch.y[:, :n_outputs].float()
-                        out    = model(batch).float()
-                        loss   = criterion(out, labels)
-                        val_loss_sum += loss.item()
-                        ss_res   += ((labels - out) ** 2).sum(dim=0)
-                        sum_t    += labels.sum(dim=0)
-                        sum_sq_t += (labels ** 2).sum(dim=0)
-                        n_total  += labels.shape[0]
-
-                target_mean    = sum_t / n_total
-                ss_tot         = (sum_sq_t - n_total * target_mean ** 2).clamp(min=0)
-                r2_per_ch      = (1 - ss_res / ss_tot.clamp(min=1e-6)).tolist()
-                r2_mean        = sum(r2_per_ch) / len(r2_per_ch)
-                epoch_val_loss = val_loss_sum / len(val_loader)
-                scheduler.step(epoch_val_loss)
-
-                r2_cols = '\t'.join(f'{v:.6f}' for v in r2_per_ch)
-                log.write(f'{epoch+1}\t{epoch_train_loss:.6f}\t{epoch_val_loss:.6f}\t'
-                          f'{r2_mean:.6f}\t{r2_cols}\t{optimizer.param_groups[0]["lr"]:.2e}\n')
-                log.flush()
-
-                result_q.put(('epoch', {
-                    'epoch':      epoch + 1,
-                    'train_loss': epoch_train_loss,
-                    'val_loss':   epoch_val_loss,
-                    'r2_mean':    r2_mean,
-                    'r2_per_ch':  r2_per_ch,
-                    'lr':         optimizer.param_groups[0]['lr'],
-                    'time':       t1 - t0,
-                }))
-
-        torch.save(model.state_dict(), f'models/{run_id}.pth')
-
-        # Final unbiased test evaluation
-        ss_res   = torch.zeros(n_outputs, device='cuda')
-        sum_t    = torch.zeros(n_outputs, device='cuda')
-        sum_sq_t = torch.zeros(n_outputs, device='cuda')
-        test_loss_sum = 0.0
-        n_total  = 0
-        results  = []
-        model.eval()
-        with torch.no_grad():
-            for batch in test_loader:
-                batch  = batch.to('cuda')
-                labels = batch.y[:, :n_outputs].float()
-                out    = model(batch).float()
-                results.extend(zip(labels.cpu().tolist(), out.cpu().tolist()))
-                loss = criterion(out, labels)
-                test_loss_sum += loss.item()
-                ss_res   += ((labels - out) ** 2).sum(dim=0)
-                sum_t    += labels.sum(dim=0)
-                sum_sq_t += (labels ** 2).sum(dim=0)
-                n_total  += labels.shape[0]
-
-        cols = ([f"true_{i}" for i in range(n_outputs)] +
-                [f"pred_{i}" for i in range(n_outputs)])
-        rows = [list(chain(t, p)) for t, p in results]
-        pd.DataFrame(rows, columns=cols).to_csv(f'results/results_{run_id}.csv', index=False)
-
-        target_mean     = sum_t / n_total
-        ss_tot          = (sum_sq_t - n_total * target_mean ** 2).clamp(min=0)
-        r2_per_joint    = (1 - ss_res / ss_tot.clamp(min=1e-6))
-        r2_mean         = r2_per_joint.mean().item()
-        epoch_test_loss = test_loss_sum / len(test_loader)
-
-        result_q.put(('done', {
-            'r2_per_joint': r2_per_joint.tolist(),
-            'r2_mean':      r2_mean,
-            'test_loss':    epoch_test_loss,
-            'run_id':       run_id,
         }))
+        result_q.put(('status', f'Run {trainer.run_id} — training started.'))
+
+        with open(trainer.log_path, 'w') as log:
+            trainer.log_header(log)
+            trainer.fit(train_loader, val_loader, cfg['epochs'], log)
+
+        trainer.save_checkpoint()
+        trainer.test(test_loader)
 
     except Exception as e:
         result_q.put(('error', str(e)))
         raise
-
-
-# ── Chart helpers ─────────────────────────────────────────────────────────────
-
-def _chart_options(title: str, series_names: list[str], y_label: str = '') -> dict:
-    return {
-        'title': {'text': title, 'textStyle': {'fontSize': 13}},
-        'tooltip': {'trigger': 'axis'},
-        'legend': {'data': series_names, 'bottom': 0},
-        'grid': {'left': '12%', 'right': '4%', 'top': '18%', 'bottom': '18%'},
-        'xAxis': {'type': 'category', 'name': 'Epoch', 'data': []},
-        'yAxis': {'type': 'value', 'name': y_label},
-        'series': [{'name': n, 'type': 'line', 'data': [], 'smooth': True,
-                    'showSymbol': False} for n in series_names],
-    }
 
 
 # ── Global queue / event ──────────────────────────────────────────────────────
@@ -236,7 +116,7 @@ train_thread: threading.Thread | None = None
 
 # ── UI ────────────────────────────────────────────────────────────────────────
 
-_cfg = _load_config()
+_cfg = _config.load()
 epochs_x: list[int] = []
 
 with ui.header().classes('bg-indigo-900 text-white items-center px-4 py-2'):
@@ -281,15 +161,15 @@ with ui.tab_panels(tabs, value=tab_train).classes('w-full'):
                     stop_btn  = ui.button('Stop',           icon='stop',        color='negative')
                     stop_btn.disable()
 
-                loss_chart = ui.echart(_chart_options(
+                loss_chart = ui.echart(chart_options(
                     'Loss', ['Train Loss', 'Val Loss'], 'Loss',
                 )).classes('w-full h-64')
 
                 with ui.row().classes('w-full gap-4'):
-                    acc_chart = ui.echart(_chart_options(
+                    acc_chart = ui.echart(chart_options(
                         'Val R² per dim', [f'dim {i}' for i in range(int(out_nums.value))], 'R²',
                     )).classes('flex-1 h-48')
-                    lr_chart = ui.echart(_chart_options(
+                    lr_chart = ui.echart(chart_options(
                         'Learning Rate', ['LR'], 'LR',
                     )).classes('flex-1 h-48')
 
@@ -320,7 +200,7 @@ with ui.tab_panels(tabs, value=tab_train).classes('w-full'):
                     'test_path':  path_test.value,
                 }
                 if _check_paths():
-                    _save_config(paths)
+                    _config.save(paths)
                     ui.notify('Paths saved.', type='positive')
                 else:
                     ui.notify('One or more paths not found — not saved.', type='warning')
@@ -358,7 +238,7 @@ def _reset_charts():
         for s in chart.options['series']:
             s['data'] = []
         chart.update()
-    acc_chart.options.update(_chart_options(
+    acc_chart.options.update(chart_options(
         'Val R² per dim', [f'dim {i}' for i in range(n)], 'R²',
     ))
     acc_chart.update()

@@ -7,80 +7,46 @@ import queue
 import sys
 import threading
 import time
-from pathlib import Path
-import pickle
+import pandas as pd
 import torch
 from torch import nn, optim
 from torch.utils.data import DataLoader
 from nicegui import ui
 
-from custom_loss import *
-from MODELS import *
-from grasp_image_set import *
-
-# ── DataLoaderGetter (replicated from torch-classify.py) ─────────────────────
-
-class DataLoaderGetter:
-    SAMPLERS = {'WeightedRandomSampler': '_get_weighted_random_sampler'}
-
-    def get(self, path, *, batch_size=32, half=False, device='cuda',
-            shuffle=False, augment=False, **_):
-        dataset: GraspImagePosesDataset = torch.load(path, weights_only=False)
-        dataset = GraspImagePosesDatasetV2.from_v1(dataset, device = device, augment = augment)
-        if half:
-            dataset.half()
-        dataset.to(device)
-        loader_kwargs = {'batch_size': batch_size}
-        loader_kwargs['shuffle'] = shuffle
-        return DataLoader(dataset, **loader_kwargs)
-
-
+from graspcnn.losses import FocalLoss
+from graspcnn.models import GraspCNNv1, GraspCNNv2, GraspCNNv3
+from graspcnn.data import GraspImageDataset
+from graspcnn.training import ConfigStore, DataLoaderGetter, chart_options
 
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
-MODELS = {
-    'MANOGraspCNNv1': MANOGraspCNNv1,
-    'MANOGraspCNNv2': MANOGraspCNNv2,
-    'MANOGraspCNNv3': MANOGraspCNNv3
-}
-LOSSES = {'GaussianNLLLoss': GaussianNLLLoss, "MSELoss": nn.MSELoss}
+MODELS = {'GraspCNNv1': GraspCNNv1, 'GraspCNNv2': GraspCNNv2, "GraspCNNv3": GraspCNNv3}
+LOSSES = {'CrossEntropy': nn.CrossEntropyLoss, 'FocalLoss': FocalLoss}
 
-CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'train_config.json')
+# Config lives at the repo root (one level above scripts/).
+CONFIG_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'train_config.json')
 _DATA_DIR   = os.path.expanduser('~/Documents/P10/hot3d/data')
 DEFAULT_PATHS = {
-    'train_path': os.path.join(_DATA_DIR, 'train_images_poses.pt'),
-    'val_path':   os.path.join(_DATA_DIR, 'val_images_poses.pt'),
-    'test_path':  os.path.join(_DATA_DIR, 'test_images_poses.pt'),
+    'train_path': os.path.join(_DATA_DIR, 'train_images.pt'),
+    'val_path':   os.path.join(_DATA_DIR, 'val_images.pt'),
+    'test_path':  os.path.join(_DATA_DIR, 'test_images.pt'),
 }
 
-def _load_config() -> dict:
-    if os.path.exists(CONFIG_FILE):
-        try:
-            return {**DEFAULT_PATHS, **json.load(open(CONFIG_FILE))}
-        except Exception:
-            pass
-    return DEFAULT_PATHS.copy()
+_config = ConfigStore(CONFIG_FILE, DEFAULT_PATHS)
 
-def _save_config(paths: dict):
-    json.dump(paths, open(CONFIG_FILE, 'w'), indent=2)
-
-def get_pca_variances(path: Path):
-    with open(path.expanduser().absolute(), 'rb') as f:
-        pca: 'PCA' = pickle.load(f)
-    return pca.explained_variance_.tolist()
 
 # ── Training thread ───────────────────────────────────────────────────────────
 
 def training_thread(cfg: dict, result_q: queue.Queue, stop_evt: threading.Event):
     try:
-        pca_variances = get_pca_variances(Path('~/Documents/P10/hot3d/pca.pkl'))
-        pca_variances = torch.Tensor(pca_variances).to("cuda")
         getter = DataLoaderGetter()
+        sampler_val = cfg['sampler'] if cfg['sampler'] != 'None' else None
         train_loader = getter.get(
             path=cfg['train_path'],
             batch_size=cfg['batch_size'], half=True, device='cuda',
-            shuffle=True,
+            sampler=sampler_val,
+            shuffle=True if sampler_val is None else None,
             augment=cfg['augment'],
         )
         val_loader = getter.get(
@@ -93,13 +59,21 @@ def training_thread(cfg: dict, result_q: queue.Queue, stop_evt: threading.Event)
         )
         result_q.put(('status', 'Data loaded. Building model...'))
 
-        model = MODELS[cfg['model']](dropout2d=cfg['dropout_2d'], dropoutfc=cfg['dropout_fc'], n_values = cfg['output_channels'])
+        model = MODELS[cfg['model']](dropout2d=cfg['dropout_2d'], dropoutfc=cfg['dropout_fc'])
         model.to('cuda')
-        torch.cuda.empty_cache()
+        torch.backends.cudnn.benchmark = True
 
-        loss_kwargs = dict(
-            reduction=cfg.get("reduction")
-        )
+        loss_kwargs = {}
+        if cfg['loss'] == 'FocalLoss':
+            loss_kwargs['gamma'] = cfg['focal_gamma']
+        if sampler_val is None:
+            # No sampler → balance via loss weights (same formula as WeightedRandomSampler)
+            ds = train_loader.dataset
+            lbl = ds.labels if hasattr(ds, 'labels') else ds.tensors[1]
+            classes = lbl.unique(sorted=True)
+            class_counts = torch.stack([(lbl == c).sum() for c in classes]).float()
+            print(f"Determined counts: {class_counts}")
+            loss_kwargs['weight'] = (class_counts.min() / class_counts).to('cuda')
         criterion = LOSSES[cfg['loss']](**loss_kwargs)
 
         optimizer = optim.Adam(model.parameters(), lr=cfg['lr'], weight_decay=cfg['weight_decay'])
@@ -121,12 +95,10 @@ def training_thread(cfg: dict, result_q: queue.Queue, stop_evt: threading.Event)
         }
         json.dump(params, open(f'params/params_{run_id}.json', 'w'), indent=2)
         result_q.put(('status', f'Run {run_id} — training started.'))
+        ub_loader = DataLoader(train_loader.dataset, batch_size=cfg['batch_size'], shuffle=False)
 
-        n_outputs = cfg['output_channels']
-        pca_variances = pca_variances[:n_outputs]
-        r2_header = '\t'.join(f'Val R2[{i}]' for i in range(n_outputs))
         with open(f'train_log/train_log_{run_id}.txt', 'w') as log:
-            log.write(f'Epoch\tTrain Loss\tVal Loss\tVal R2 Mean\t{r2_header}\tLR\n')
+            log.write('Epoch\tTrain Loss (bias)\tTrain Loss (no bias)\tVal Loss\tVal Acc\tLR\n')
 
             for epoch in range(cfg['epochs']):
                 if stop_evt.is_set():
@@ -136,133 +108,90 @@ def training_thread(cfg: dict, result_q: queue.Queue, stop_evt: threading.Event)
                 t0 = time.time()
                 model.train()
                 train_loss = torch.tensor(0.0, device='cuda')
-                print("Training epoch: ", epoch + 1)
-
                 for inputs, labels in train_loader:
                     inputs = inputs.to('cuda', non_blocking=True).float()
-                    labels = labels.to('cuda', non_blocking=True)[:,:n_outputs]
+                    labels = labels.to('cuda', non_blocking=True)
                     optimizer.zero_grad()
-                    out = model(inputs)
-                    loss = criterion(out, labels)
-                    if isinstance(loss, torch.Tensor) and loss.numel() > 1:
-                        loss = (loss/pca_variances).mean()
+                    loss = criterion(model(inputs), labels)
                     loss.backward()
                     optimizer.step()
                     train_loss += loss.detach()
                 epoch_train_loss = (train_loss / len(train_loader)).item()
                 t1 = time.time()
 
-                # validation loss + R² (single pass, computational formula)
+                # unbiased eval on training set (no augmentation, no sampler)
                 model.eval()
-                val_loss_sum = 0.0
-                ss_res   = torch.zeros(n_outputs, device='cuda')
-                sum_t    = torch.zeros(n_outputs, device='cuda')
-                sum_sq_t = torch.zeros(n_outputs, device='cuda')
-                n_total  = 0
-                print("validation epoch: ", epoch + 1)
+                if hasattr(train_loader.dataset, 'augment'):
+                    train_loader.dataset.augment = False
+                train_loss_ub = torch.tensor(0.0, device='cuda')
+                with torch.no_grad():
+                    for inputs, labels in ub_loader:
+                        inputs = inputs.to('cuda', non_blocking=True).float()
+                        labels = labels.to('cuda', non_blocking=True)
+                        train_loss_ub += criterion(model(inputs), labels).detach()
+                epoch_train_loss_ub = (train_loss_ub / len(ub_loader)).item()
+                if cfg['augment'] and hasattr(train_loader.dataset, 'augment'):
+                    train_loader.dataset.augment = True
+
+                val_loss = torch.tensor(0.0, device='cuda')
+                correct = 0
                 with torch.no_grad():
                     for inputs, labels in val_loader:
                         inputs = inputs.to('cuda', non_blocking=True).float()
-                        labels = labels.to('cuda', non_blocking=True)[:,:n_outputs]
-                        out = model(inputs)
-                        loss = criterion(out, labels)
-                        if isinstance(loss, torch.Tensor) and loss.numel() > 1:
-                            loss = (loss / pca_variances).mean()
-
-                        val_loss_sum += loss.item()
-                        ss_res   += ((labels - out) ** 2).sum(dim=0)
-                        sum_t    += labels.sum(dim=0)
-                        sum_sq_t += (labels ** 2).sum(dim=0)
-                        n_total  += labels.shape[0]
-
-                target_mean     = sum_t / n_total
-                ss_tot          = (sum_sq_t - n_total * target_mean ** 2).clamp(min=0)
-                r2_per_ch       = (1 - ss_res / ss_tot.clamp(min=1e-6)).tolist()
-                r2_mean         = sum(r2_per_ch) / len(r2_per_ch)
-                epoch_val_loss  = val_loss_sum / len(val_loader)
-                scheduler.step(epoch_val_loss)
-
-                r2_cols = '\t'.join(f'{v:.6f}' for v in r2_per_ch)
-                log.write(f'{epoch+1}\t{epoch_train_loss:.6f}\t{epoch_val_loss:.6f}\t'
-                          f'{r2_mean:.6f}\t{r2_cols}\t{optimizer.param_groups[0]["lr"]:.2e}\n')
-                log.flush()
+                        labels = labels.to('cuda', non_blocking=True)
+                        outputs = model(inputs)
+                        val_loss += criterion(outputs, labels).detach()
+                        correct += (outputs.argmax(1) == labels).sum().detach()
+                epoch_val_loss = (val_loss / len(val_loader)).item()
+                epoch_val_acc = (correct / len(val_loader.dataset)).item()
+                t2 = time.time()
+                current_lr = optimizer.param_groups[0]['lr']
 
                 result_q.put(('epoch', {
-                    'epoch':      epoch + 1,
+                    'epoch': epoch + 1,
                     'train_loss': epoch_train_loss,
-                    'val_loss':   epoch_val_loss,
-                    'r2_mean':    r2_mean,
-                    'r2_per_ch':  r2_per_ch,
-                    'lr':         optimizer.param_groups[0]['lr'],
-                    'time':       t1 - t0,
+                    'train_loss_ub': epoch_train_loss_ub,
+                    'val_loss': epoch_val_loss,
+                    'val_acc': epoch_val_acc,
+                    'lr': current_lr,
+                    'time': t2 - t0,
                 }))
+                log.write(f'{epoch + 1}\t{epoch_train_loss}\t{epoch_train_loss_ub}\t'
+                          f'{epoch_val_loss}\t{epoch_val_acc}\t{current_lr}\n')
+                log.flush()
 
-        torch.save(model.state_dict(), "models/"+  run_id + '.pth')
+                scheduler.step(epoch_val_loss)
+                if epoch_val_loss >= cfg['overfit_mult'] * epoch_train_loss_ub and epoch + 1 > 25:
+                    result_q.put(('status',
+                        f'Early stop: val={epoch_val_loss:.4f} >= '
+                        f'{cfg["overfit_mult"]} × train={epoch_train_loss_ub:.4f}'))
+                    break
 
-        # Final unbiased test evaluation — run once after training completes
-        n_outputs = cfg['output_channels']
-        ss_res   = torch.zeros(n_outputs, device='cuda')
-        sum_t    = torch.zeros(n_outputs, device='cuda')
-        sum_sq_t = torch.zeros(n_outputs, device='cuda')
-        test_loss_sum = 0.0
-        n_total  = 0
-        results = []
+        torch.save(model.state_dict(), f'models/{run_id}.pth')
         model.eval()
-        import pandas as pd
+        test_loss_sum = 0.0
+        cm = torch.zeros((3, 3), dtype=torch.int64)
+        results = []
         with torch.no_grad():
             for inputs, labels in test_loader:
-                inputs = inputs.to('cuda', non_blocking=True).float()
-                labels = labels.to('cuda', non_blocking=True)[:,:n_outputs]
-                out = model(inputs)
-                results.extend(zip(labels, out))
-                loss = criterion(out, labels)
-                if isinstance(loss, torch.Tensor) and loss.numel() > 1:
-                    loss = (loss / pca_variances).mean()
-                test_loss_sum += loss.item()
-                ss_res   += ((labels - out) ** 2).sum(dim=0)
-                sum_t    += labels.sum(dim=0)
-                sum_sq_t += (labels ** 2).sum(dim=0)
-                n_total  += labels.shape[0]
-        results: list[tuple[list[float], list[float]]] # list of label list / prediction list tuples
-        cols = [f"true_{i}" for i in range(len(results[0][0]))] +\
-               [f"pred_{i}" for i in range(len(results[0][1]))]
-        from itertools import chain
-        results: list[list[float]] = [chain(*x) for x in results]
-        assert len(cols) == len(results[0])
-        pd.DataFrame(results, columns= cols).to_csv(f'results/results_{run_id}.csv', index=False)
-        del cols, results
-
-        target_mean  = sum_t / n_total
-        ss_tot       = (sum_sq_t - n_total * target_mean ** 2).clamp(min=0)
-        r2_per_joint = (1 - ss_res / ss_tot.clamp(min=1e-6))
-        r2_mean      = r2_per_joint.mean().item()
-        epoch_test_loss = test_loss_sum / len(test_loader)
-
+                inputs: torch.Tensor = inputs.to('cuda', non_blocking=True).float()
+                labels: torch.Tensor = labels.to('cuda', non_blocking=True)
+                outputs = model(inputs)
+                test_loss_sum += criterion(outputs, labels).item()
+                preds = outputs.argmax(1).cpu()
+                results.append(pd.DataFrame(dict(label=labels, pred=preds)))
+                cm += torch.zeros(3, 3, dtype=torch.int64).index_put_(
+                    (labels.cpu(), preds), torch.ones(len(preds), dtype=torch.int64), accumulate=True)
+        pd.concat(results, ignore_index = True).to_csv(f'results/results_{run_id}.csv', index=False)
         result_q.put(('done', {
-            'r2_per_joint': r2_per_joint.tolist(),
-            'r2_mean':      r2_mean,
-            'test_loss':    epoch_test_loss,
-            'run_id':       run_id,
+            'cm': cm.tolist(),
+            'test_loss': test_loss_sum / len(test_loader),
+            'run_id': run_id,
         }))
 
     except Exception as e:
         result_q.put(('error', str(e)))
         raise
-
-
-# ── Chart helpers ─────────────────────────────────────────────────────────────
-
-def _chart_options(title: str, series_names: list[str], y_label: str = '') -> dict:
-    return {
-        'title': {'text': title, 'textStyle': {'fontSize': 13}},
-        'tooltip': {'trigger': 'axis'},
-        'legend': {'data': series_names, 'bottom': 0},
-        'grid': {'left': '12%', 'right': '4%', 'top': '18%', 'bottom': '18%'},
-        'xAxis': {'type': 'category', 'name': 'Epoch', 'data': []},
-        'yAxis': {'type': 'value', 'name': y_label},
-        'series': [{'name': n, 'type': 'line', 'data': [], 'smooth': True,
-                    'showSymbol': False} for n in series_names],
-    }
 
 
 # ── Global queue / event (shared across the single-page app) ──────────────────
@@ -273,7 +202,7 @@ train_thread: threading.Thread | None = None
 
 # ── UI ────────────────────────────────────────────────────────────────────────
 
-_cfg = _load_config()
+_cfg = _config.load()
 epochs_x: list[int] = []
 
 with ui.header().classes('bg-blue-900 text-white items-center px-4 py-2'):
@@ -294,24 +223,30 @@ with ui.tab_panels(tabs, value=tab_train).classes('w-full'):
             with ui.card().classes('w-72 shrink-0 gap-1'):
                 ui.label('Configuration').classes('text-base font-semibold')
 
-                model_sel   = ui.select(list(MODELS), value='MANOGraspCNNv2', label='Model').classes('w-full')
-                out_nums    = ui.number("Output values", min = 1, max= 15, value = 3, step = 1).classes('w-full')
-                loss_sel    = ui.select(list(LOSSES), value='MSELoss', label='Loss Function').classes('w-full')
-                reduc_sel   = ui.select(['mean', 'sum', 'none'], value='mean', label="Reduction").classes('w-full')
-                reduc_sel.set_visibility(True)
+                model_sel   = ui.select(list(MODELS), value='GraspCNNv1', label='Model').classes('w-full')
+                gamma_row   = ui.number('Focal γ', value=2.0, step=0.5, min=0.0).classes('w-full')
+                gamma_row.set_visibility(False)
+                loss_sel    = ui.select(list(LOSSES), value='CrossEntropy', label='Loss Function',
+                                        on_change=lambda e: gamma_row.set_visibility(e.value == 'FocalLoss'),
+                                        ).classes('w-full')
 
                 ui.separator()
-                dropout_fc  = ui.number('Dropout FC',    value=0.3,  step=0.05, min=0.0, max=1.0).classes('w-full')
-                dropout_2d  = ui.number('Dropout 2D',    value=0.2,  step=0.05, min=0.0, max=1.0).classes('w-full')
-                lr_inp      = ui.number('Learning Rate', value=3e-4, step=1e-4, min=1e-7, format='%.7f').classes('w-full')
+                dropout_fc  = ui.number('Dropout FC',    value=0.5,  step=0.05, min=0.0, max=1.0).classes('w-full')
+                dropout_2d  = ui.number('Dropout 2D',    value=0.3,  step=0.05, min=0.0, max=1.0).classes('w-full')
+                lr_inp      = ui.number('Learning Rate', value=1e-3, step=1e-4, min=1e-7, format='%.7f').classes('w-full')
                 wd_inp      = ui.number('Weight Decay',  value=1e-4, step=1e-5, min=0.0,  format='%.7f').classes('w-full')
-                epochs_inp  = ui.number('Max Epochs',    value=500, step=10,   min=1).classes('w-full')
+                epochs_inp  = ui.number('Max Epochs',    value=1000, step=10,   min=1).classes('w-full')
                 batch_inp   = ui.number('Batch Size',    value=32,   step=8,    min=1).classes('w-full')
-                overfit_inp   = ui.number('Overfit Mult.',      value=3.0,  step=0.1, min=1.0).classes('w-full')
-                scheduler_inp = ui.number('Scheduler Patience', value=25 ,   step=1,   min=1).classes('w-full')
+                overfit_inp   = ui.number('Overfit Mult.',      value=2.0,  step=0.1, min=1.0).classes('w-full')
+                scheduler_inp = ui.number('Scheduler Patience', value=10,   step=1,   min=1).classes('w-full')
 
                 ui.separator()
                 augment_chk = ui.checkbox('Augment train data', value=True)
+                sampler_sel = ui.select(
+                    ['None', 'WeightedRandomSampler'],
+                    value='WeightedRandomSampler',
+                    label='Sampler',
+                ).classes('w-full')
 
                 ui.separator()
                 status_lbl = ui.label('Ready').classes('text-sm text-gray-500 italic')
@@ -324,17 +259,17 @@ with ui.tab_panels(tabs, value=tab_train).classes('w-full'):
                     stop_btn  = ui.button('Stop',           icon='stop',        color='negative')
                     stop_btn.disable()
 
-                loss_chart = ui.echart(_chart_options(
+                loss_chart = ui.echart(chart_options(
                     'Loss',
-                    ['Train Loss', 'Val Loss'],
+                    ['Train (bias)', 'Train (no bias)', 'Val Loss'],
                     'Loss',
                 )).classes('w-full h-64')
 
                 with ui.row().classes('w-full gap-4'):
-                    acc_chart = ui.echart(_chart_options(
-                        'Val R² per dim', [f'dim {i}' for i in range(int(out_nums.value))], 'R²',
+                    acc_chart = ui.echart(chart_options(
+                        'Validation Accuracy (balanced)', ['Val Acc'], 'Accuracy',
                     )).classes('flex-1 h-48')
-                    lr_chart = ui.echart(_chart_options(
+                    lr_chart = ui.echart(chart_options(
                         'Learning Rate', ['LR'], 'LR',
                     )).classes('flex-1 h-48')
 
@@ -365,7 +300,7 @@ with ui.tab_panels(tabs, value=tab_train).classes('w-full'):
                     'test_path':  path_test.value,
                 }
                 if _check_paths():
-                    _save_config(paths)
+                    _config.save(paths)
                     ui.notify('Paths saved.', type='positive')
                 else:
                     ui.notify('One or more paths not found — not saved.', type='warning')
@@ -382,9 +317,8 @@ with ui.tab_panels(tabs, value=tab_train).classes('w-full'):
 def _collect_cfg() -> dict:
     return dict(
         model=model_sel.value,
-        output_channels=int(out_nums.value),
         loss=loss_sel.value,
-        reduction=reduc_sel.value,
+        focal_gamma=float(gamma_row.value),
         dropout_fc=float(dropout_fc.value),
         dropout_2d=float(dropout_2d.value),
         lr=float(lr_inp.value),
@@ -394,6 +328,7 @@ def _collect_cfg() -> dict:
         overfit_mult=float(overfit_inp.value),
         scheduler_patience=int(scheduler_inp.value),
         augment=augment_chk.value,
+        sampler=sampler_sel.value,
         train_path=os.path.expanduser(path_train.value),
         val_path=os.path.expanduser(path_val.value),
         test_path=os.path.expanduser(path_test.value),
@@ -402,16 +337,11 @@ def _collect_cfg() -> dict:
 
 def _reset_charts():
     epochs_x.clear()
-    n = int(out_nums.value)
-    for chart in (loss_chart, lr_chart):
+    for chart in (loss_chart, acc_chart, lr_chart):
         chart.options['xAxis']['data'] = []
         for s in chart.options['series']:
             s['data'] = []
         chart.update()
-    acc_chart.options.update(_chart_options(
-        'Val R² per dim', [f'dim {i}' for i in range(n)], 'R²',
-    ))
-    acc_chart.update()
 
 
 def _push_epoch(data: dict):
@@ -419,13 +349,13 @@ def _push_epoch(data: dict):
     epochs_x.append(e)
 
     loss_chart.options['xAxis']['data'] = epochs_x.copy()
-    loss_chart.options['series'][0]['data'].append(round(data['train_loss'], 6))
-    loss_chart.options['series'][1]['data'].append(round(data['val_loss'],   6))
+    loss_chart.options['series'][0]['data'].append(round(data['train_loss'],    6))
+    loss_chart.options['series'][1]['data'].append(round(data['train_loss_ub'], 6))
+    loss_chart.options['series'][2]['data'].append(round(data['val_loss'],      6))
     loss_chart.update()
 
     acc_chart.options['xAxis']['data'] = epochs_x.copy()
-    for i, r2 in enumerate(data['r2_per_ch']):
-        acc_chart.options['series'][i]['data'].append(round(r2, 6))
+    acc_chart.options['series'][0]['data'].append(round(data['val_acc'], 6))
     acc_chart.update()
 
     lr_chart.options['xAxis']['data'] = epochs_x.copy()
@@ -434,38 +364,40 @@ def _push_epoch(data: dict):
 
     status_lbl.set_text(
         f"Epoch {e} | train={data['train_loss']:.4f} | "
-        f"val={data['val_loss']:.4f} | R²={data['r2_mean']:.4f} | "
+        f"val={data['val_loss']:.4f} | acc={data['val_acc']:.4f} | "
         f"{data['time']:.1f}s/epoch"
     )
 
 
 def _show_done_dialog(data: dict):
-    r2_per_joint = data['r2_per_joint']
-    r2_mean      = data['r2_mean']
-    run_id       = data['run_id']
-    test_loss    = data['test_loss']
+    cm       = data['cm']
+    run_id   = data['run_id']
+    test_loss = data['test_loss']
+    class_names = ['Lateral', 'Pinch', 'Power']
 
     with ui.dialog() as dlg, ui.card().classes('p-6 gap-3 min-w-[420px]'):
         ui.label('Training Complete!').classes('text-2xl font-bold text-green-600')
         ui.label(f'Run ID: {run_id}').classes('text-sm text-gray-500')
         ui.label(f'Test Loss: {test_loss:.4f}').classes('text-lg font-semibold')
-        ui.label(f'Mean R²: {r2_mean:.4f}').classes('text-lg font-semibold')
 
         ui.separator()
-        ui.label('R² per Joint').classes('font-semibold')
+        ui.label('Confusion Matrix').classes('font-semibold')
 
-        with ui.grid(columns=2).classes('gap-1 text-sm w-full'):
-            ui.label('Joint').classes('font-medium text-blue-700')
-            ui.label('R²').classes('font-medium text-blue-700 text-center')
-            for i, r2 in enumerate(r2_per_joint):
-                ui.label(f'Joint {i+1}').classes('text-gray-700')
-                bg = 'bg-green-200' if r2 >= 0.7 else 'bg-yellow-100' if r2 >= 0.4 else 'bg-red-100'
-                ui.label(f'{r2:.4f}').classes(f'text-center p-1 rounded {bg}')
+        with ui.grid(columns=4).classes('gap-1 text-sm'):
+            ui.label('')  # top-left corner
+            for name in class_names:
+                ui.label(f'Pred: {name}').classes('text-center font-medium text-blue-700')
+            for i, row in enumerate(cm):
+                ui.label(f'True: {class_names[i]}').classes('font-medium text-blue-700')
+                for j, val in enumerate(row):
+                    bg = 'bg-green-200' if i == j else 'bg-red-50'
+                    ui.label(str(val)).classes(f'text-center p-1 rounded {bg}')
 
         ui.separator()
         ui.button('Close', on_click=dlg.close).classes('w-full')
 
     dlg.open()
+
 
 def _on_done(data: dict):
     start_btn.enable()

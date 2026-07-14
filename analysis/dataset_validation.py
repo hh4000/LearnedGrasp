@@ -1,7 +1,7 @@
 import torch
 import sys, os
 from pathlib import Path
-from grasp_image_set import GraspImagePosesDataset
+from graspcnn.data import GraspImagePosesDataset
 from tqdm import tqdm
 
 data_path = Path("~/Documents/P10/hot3d/data/train_images_poses.pt").expanduser()

@@ -54,8 +54,16 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from torch_geometric.data import Batch
 
-from MODELS import *
-from grasp_mesh_set import PrecachedMANOGraspDataset
+from graspcnn.models import (
+    MANOGraspGNNv1,
+    MANOGraspGNNv2,
+    MANOGraspGNNv3,
+    MANOGraspGNNv4,
+    MANOGraspGNNv5,
+    MANOGraspGNNv6,
+    MANOGraspGNNv7,
+)
+from graspcnn.data import PrecachedMANOGraspDataset
 
 MODELS = {
     'MANOGraspGNNv1': MANOGraspGNNv1,

@@ -15,7 +15,7 @@ import matplotlib.cm as cm
 import numpy as np
 import torch
 
-from grasp_mesh_set import PrecachedMANOGraspDataset
+from graspcnn.data import PrecachedMANOGraspDataset
 
 
 def plot_sample(dataset: PrecachedMANOGraspDataset, idx: int = 0, normal_scale: float = 0.02):

@@ -30,8 +30,17 @@ from torch import nn, optim
 from torch_geometric.loader import DataLoader as GeoDataLoader
 from tqdm import tqdm
 
-import grasp_mesh_set
-from MODELS import *
+import graspcnn.data.mesh_set as grasp_mesh_set
+from graspcnn.models import (
+    MANOGraspGNNv1,
+    MANOGraspGNNv2,
+    MANOGraspGNNv3,
+    MANOGraspGNNv4,
+    MANOGraspGNNv5,
+    MANOGraspGNNv6,
+    MANOGraspGNNv7,
+)
+from graspcnn.training import R2Accumulator
 
 # ── Constants / paths ──────────────────────────────────────────────────────────
 
@@ -253,10 +262,7 @@ def run_trial(
             # validate
             model.eval()
             val_loss_sum = 0.0
-            ss_res   = torch.zeros(n_outputs, device='cuda')
-            sum_t    = torch.zeros(n_outputs, device='cuda')
-            sum_sq_t = torch.zeros(n_outputs, device='cuda')
-            n_total  = 0
+            r2 = R2Accumulator(n_outputs, device='cuda')
             with torch.no_grad():
                 for batch in val_loader:
                     batch  = batch.to('cuda', non_blocking=True)
@@ -265,14 +271,9 @@ def run_trial(
                     with torch.autocast('cuda', enabled=use_amp):
                         out = model(batch).float()
                     val_loss_sum += criterion(out, labels).item()
-                    ss_res   += ((labels - out) ** 2).sum(dim=0)
-                    sum_t    += labels.sum(dim=0)
-                    sum_sq_t += (labels ** 2).sum(dim=0)
-                    n_total  += labels.shape[0]
+                    r2.update(labels, out)
 
-            target_mean    = sum_t / n_total
-            ss_tot         = (sum_sq_t - n_total * target_mean ** 2).clamp(min=0)
-            r2_per_ch      = (1 - ss_res / ss_tot.clamp(min=1e-6)).tolist()
+            r2_per_ch      = r2.r2_per_channel().tolist()
             r2_mean        = sum(r2_per_ch) / len(r2_per_ch)
             epoch_val_loss = val_loss_sum / len(val_loader)
             elapsed        = time.time() - t0
@@ -316,11 +317,8 @@ def run_trial(
     model.load_state_dict(torch.load(ckpt_path, weights_only=True))
     model.eval()
 
-    ss_res   = torch.zeros(n_outputs, device='cuda')
-    sum_t    = torch.zeros(n_outputs, device='cuda')
-    sum_sq_t = torch.zeros(n_outputs, device='cuda')
+    r2 = R2Accumulator(n_outputs, device='cuda')
     test_loss_sum = 0.0
-    n_total  = 0
     results  = []
 
     with torch.no_grad():
@@ -332,14 +330,9 @@ def run_trial(
                 out = model(batch).float()
             results.extend(zip(labels.cpu().tolist(), out.cpu().tolist()))
             test_loss_sum += criterion(out, labels).item()
-            ss_res   += ((labels - out) ** 2).sum(dim=0)
-            sum_t    += labels.sum(dim=0)
-            sum_sq_t += (labels ** 2).sum(dim=0)
-            n_total  += labels.shape[0]
+            r2.update(labels, out)
 
-    target_mean  = sum_t / n_total
-    ss_tot       = (sum_sq_t - n_total * target_mean ** 2).clamp(min=0)
-    r2_per_joint = (1 - ss_res / ss_tot.clamp(min=1e-6))
+    r2_per_joint = r2.r2_per_channel()
     r2_mean_test = r2_per_joint.mean().item()
     test_loss    = test_loss_sum / len(test_loader)
 
