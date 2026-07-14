@@ -1,7 +1,7 @@
 # Deep learning for grasp inference of the HOT3D dataset
  <img src="img.png">
 In the present repository, I have attempted to learn the grasp from just visual and gaze data. 
-All attempted models can be found in [<b>src/graspcnn/models.py</b>].
+All attempted models can be found in [`src/graspcnn/models.py`](src/graspcnn/models.py).
 You will be able to see that I eventually strayed away from CNN models in favor of GNN models. 
 This is rather a change in object representation from RGB image to 3D mesh.
 Ultimately the models I made were dubious, with lackluster (but statistically significant) performance.
@@ -42,7 +42,7 @@ Datasets cached before this restructure still load: legacy pickle module paths
 `graspcnn._compat`.
 
 ## Latest developments
-Before hand-in of my master thesis, I rushed out a script to attempt contrastive learning (<b>scripts/encoding_test.py</b>), where I tried to see if the GNN could learn object affordance from object geometry alone.
+Before hand-in of my master thesis, I rushed out a script to attempt contrastive learning [`scripts/encoding_test.py`](scripts/encoding_test.py), where I tried to see if the GNN could learn object affordance from object geometry alone.
 This was achieved by simply picking an anchor, and giving 3 positive (similar) examples and 2 negative (dissimilar) examples.
 These are:
 - <b>anchor</b> (original point)
