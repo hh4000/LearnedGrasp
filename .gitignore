@@ -1,0 +1,7 @@
+# Project exclude paths
+/.data_cache/
+/models/
+/params/
+/results/
+/scrapped/
+/train_log/

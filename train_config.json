@@ -1,0 +1,5 @@
+{
+  "train_path": "/home/hans-henrik-dalgaard/Documents/P10/hot3d/data/train_images_grasp_type.pt",
+  "val_path": "/home/hans-henrik-dalgaard/Documents/P10/hot3d/data/val_images_grasp_type.pt",
+  "test_path": "/home/hans-henrik-dalgaard/Documents/P10/hot3d/data/test_images_grasp_type.pt"
+}
